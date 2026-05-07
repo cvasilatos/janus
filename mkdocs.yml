@@ -1,0 +1,20 @@
+site_name: janus
+theme:
+  name: readthedocs
+  color_mode: dark
+
+
+nav:
+  - Home: index.md
+  - API: api.md
+
+plugins:
+  - search
+  - include-markdown
+  - mkdocstrings:
+        handlers:
+          python:
+            paths: ["src/janus/"]
+
+markdown_extensions:
+  - admonition

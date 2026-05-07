@@ -1,0 +1,20 @@
+line-length = 180
+target-version = "py314"
+exclude = [".git", ".ruff_cache", ".venv", "build", "dist", "__pycache__", ".pytest_cache"]
+src = ["./src"]
+
+lint.select = ["ALL"]
+lint.ignore = [
+    "COM812", # Missing trailing comma conflicts with formatter configuration
+    "G004", # log with f-string
+    "TRY003", # Avoid specifying long messages outside the exception class
+    "EM101", # Exception must not use a string literal, assign to variable first
+    "EM102", # Exception must not use an f-string literal, assign to variable first
+    "D100", # Missing docstring in public module
+]
+
+lint.isort = { combine-as-imports = true, split-on-trailing-comma=false }
+format = { quote-style = "double", indent-style = "space", skip-magic-trailing-comma = true }
+
+[lint.pydocstyle]
+convention = "google"

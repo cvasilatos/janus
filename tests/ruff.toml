@@ -1,0 +1,5 @@
+lint.ignore = [
+    "S101",    # Allow 'assert' (standard in pytest)
+    "F841",    # Allow unused variables (common when mocking)
+    "ARG001",  # Unused function arguments (common in fixtures)
+]
