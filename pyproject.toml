@@ -17,6 +17,10 @@ requires-python = ">=3.14"
 
 dependencies = [
     "decima @ git+https://github.com/cvasilatos/decima.git@f05d99edb1f60d0f5236e9d4099883d8448e7f38",
+    "pandas>=3.0.2",
+    "pyshark>=0.6",
+    "speculum @ git+https://github.com/cvasilatos/speculum.git",
+    "tqdm>=4.67.3",
     "typer>=0.16.0",
 ]
 

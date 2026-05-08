@@ -11,6 +11,7 @@ lint.ignore = [
     "EM101", # Exception must not use a string literal, assign to variable first
     "EM102", # Exception must not use an f-string literal, assign to variable first
     "D100", # Missing docstring in public module
+    "D104", # Missing docstring in public package
 ]
 
 lint.isort = { combine-as-imports = true, split-on-trailing-comma=false }

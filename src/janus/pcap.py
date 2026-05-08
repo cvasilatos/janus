@@ -6,9 +6,10 @@ import json
 import struct
 from collections import defaultdict, deque
 from contextlib import ExitStack
-from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
+
+from janus.model import RequestResponsePair, TcpPayload
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -40,42 +41,6 @@ class OutputFormat(StrEnum):
 
     CSV = "csv"
     JSONL = "jsonl"
-
-
-@dataclass(frozen=True, slots=True)
-class TcpPayload:
-    """A TCP segment with a non-empty application payload."""
-
-    timestamp: float
-    src_ip: str
-    src_port: int
-    dst_ip: str
-    dst_port: int
-    seq: int
-    ack: int
-    payload: bytes
-
-
-@dataclass(frozen=True, slots=True)
-class RequestResponsePair:
-    """A matched request and response payload pair."""
-
-    request: TcpPayload
-    response: TcpPayload
-
-    @property
-    def source_text(self) -> str:
-        """Return the request payload as lowercase hexadecimal text."""
-        return self.request.payload.hex()
-
-    @property
-    def target_text(self) -> str:
-        """Return the response payload as lowercase hexadecimal text."""
-        return self.response.payload.hex()
-
-    def as_record(self, source_column: str, target_column: str) -> dict[str, str]:
-        """Return the pair using caller-selected dataset column names."""
-        return {source_column: self.source_text, target_column: self.target_text}
 
 
 def iter_request_response_pairs(pcap_path: Path, server_port: int) -> Iterator[RequestResponsePair]:
@@ -232,8 +197,6 @@ def parse_tcp_segment(segment: bytes, timestamp: float, src_ip: str, dst_ip: str
         return None
 
     payload = segment[header_length:]
-    if not payload:
-        return None
 
     return TcpPayload(timestamp=timestamp, src_ip=src_ip, src_port=src_port, dst_ip=dst_ip, dst_port=dst_port, seq=seq, ack=ack, payload=payload)
 
