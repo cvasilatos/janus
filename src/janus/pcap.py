@@ -1,39 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 import csv
-import ipaddress
 import json
-import struct
-from collections import defaultdict, deque
 from contextlib import ExitStack
+from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from janus.model import RequestResponsePair, TcpPayload
+import pyshark
+
+from janus.model.request_response_pair import RequestResponsePair
+from janus.model.tcp_payload import TcpPayload
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
     from io import TextIOWrapper
     from pathlib import Path
 
+    from pyshark.packet.packet import Packet
+
 SOURCE_TEXT = "source_text"
 TARGET_TEXT = "target_text"
-
-DLT_EN10MB = 1
-ETHERTYPE_IPV4 = 0x0800
-ETHERTYPE_IPV6 = 0x86DD
-IPV4_VERSION = 4
-IPV6_VERSION = 6
-MIN_ETHERNET_HEADER_LENGTH = 14
-PCAP_GLOBAL_HEADER_LENGTH = 24
-MIN_IPV4_HEADER_LENGTH = 20
-MIN_IPV6_HEADER_LENGTH = 40
-MIN_TCP_HEADER_LENGTH = 20
-TCP_PROTOCOL_NUMBER = 6
-VLAN_ETHERTYPES = {0x8100, 0x88A8, 0x9100}
-
-FlowKey = tuple[str, int, str, int]
-MatchKey = tuple[FlowKey, int]
 
 
 class OutputFormat(StrEnum):
@@ -43,162 +31,141 @@ class OutputFormat(StrEnum):
     JSONL = "jsonl"
 
 
-def iter_request_response_pairs(pcap_path: Path, server_port: int) -> Iterator[RequestResponsePair]:
-    """Yield TCP request/response pairs from a classic Ethernet pcap file.
+def iter_request_response_pairs(pcap_path: Path, server_port: int, *, protocol: str | None = None, capture_layer: str | None = None) -> Iterator[RequestResponsePair]:
+    """Yield TCP request/response pairs from a pcap file.
 
     Requests are packets whose destination port is ``server_port``. Responses are
     packets whose source port is ``server_port``. Matching uses the same
-    sequence/acknowledgement strategy as the LLMPot parser: a request's ACK
-    number must equal the response's SEQ number on the same TCP flow.
+    strategy as the LLMPot parser: a request's ACK number must equal a
+    response's SEQ number.
     """
-    pending_requests: defaultdict[MatchKey, deque[TcpPayload]] = defaultdict(deque)
-    pending_responses: defaultdict[MatchKey, deque[TcpPayload]] = defaultdict(deque)
+    request_packets: dict[int, TcpPayload] = {}
+    response_packets: dict[int, TcpPayload] = {}
 
-    for packet in iter_tcp_payloads(pcap_path):
+    for packet in iter_tcp_payloads(pcap_path, server_port=server_port, protocol=protocol, capture_layer=capture_layer):
         if packet.dst_port == server_port:
-            flow = (packet.src_ip, packet.src_port, packet.dst_ip, packet.dst_port)
-            key = (flow, packet.ack)
-            if pending_responses[key]:
-                yield RequestResponsePair(request=packet, response=pending_responses[key].popleft())
-            else:
-                pending_requests[key].append(packet)
+            request_packets[packet.ack] = packet
         elif packet.src_port == server_port:
-            flow = (packet.dst_ip, packet.dst_port, packet.src_ip, packet.src_port)
-            key = (flow, packet.seq)
-            if pending_requests[key]:
-                yield RequestResponsePair(request=pending_requests[key].popleft(), response=packet)
-            else:
-                pending_responses[key].append(packet)
+            response_packets[packet.seq] = packet
+
+    for ack, request in request_packets.items():
+        if ack in response_packets:
+            yield RequestResponsePair(request=request, response=response_packets[ack])
 
 
-def iter_tcp_payloads(pcap_path: Path) -> Iterator[TcpPayload]:
-    """Yield TCP payloads from supported packet records in ``pcap_path``."""
-    for timestamp, frame in iter_ethernet_frames(pcap_path):
-        packet = parse_ethernet_tcp_payload(frame, timestamp)
-        if packet is not None:
-            yield packet
+def iter_tcp_payloads(pcap_path: Path, *, server_port: int | None = None, protocol: str | None = None, capture_layer: str | None = None) -> Iterator[TcpPayload]:
+    """Yield TCP payloads decoded by tshark from ``pcap_path``."""
+    capture_options: dict[str, object] = {"use_json": True, "include_raw": True, "eventloop": event_loop()}
+    if protocol is not None:
+        capture_options["display_filter"] = protocol
+    if server_port is not None and capture_layer is not None:
+        capture_options["decode_as"] = {f"tcp.port=={server_port}": capture_layer}
+
+    capture = pyshark.FileCapture(str(pcap_path), **capture_options)
+    try:
+        for packet in capture:
+            payload = packet_payload(packet, protocol)
+            if payload:
+                yield tcp_payload(packet, payload)
+    finally:
+        capture.close()
 
 
-def iter_ethernet_frames(pcap_path: Path) -> Iterator[tuple[float, bytes]]:
-    """Yield timestamped Ethernet frames from a classic libpcap file."""
-    with pcap_path.open("rb") as file_obj:
-        header = file_obj.read(PCAP_GLOBAL_HEADER_LENGTH)
-        if len(header) != PCAP_GLOBAL_HEADER_LENGTH:
-            raise ValueError("pcap file is missing its global header")
-
-        endian, timestamp_resolution = pcap_byte_order(header[:4])
-        _version_major, _version_minor, _thiszone, _sigfigs, _snaplen, link_type = struct.unpack(f"{endian}HHIIII", header[4:24])
-        if link_type != DLT_EN10MB:
-            raise ValueError(f"unsupported pcap link type {link_type}; only Ethernet pcaps are supported")
-
-        packet_header = struct.Struct(f"{endian}IIII")
-        while record_header := file_obj.read(packet_header.size):
-            if len(record_header) != packet_header.size:
-                raise ValueError("pcap file has a truncated packet header")
-            ts_sec, ts_fraction, included_length, _original_length = packet_header.unpack(record_header)
-            frame = file_obj.read(included_length)
-            if len(frame) != included_length:
-                raise ValueError("pcap file has a truncated packet body")
-            yield ts_sec + (ts_fraction / timestamp_resolution), frame
+def event_loop() -> asyncio.AbstractEventLoop:
+    """Return the current event loop, creating one for pyshark when needed."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
 
 
-def pcap_byte_order(magic: bytes) -> tuple[str, int]:
-    """Return struct byte order and timestamp resolution for a pcap magic value."""
-    match magic:
-        case b"\xd4\xc3\xb2\xa1":
-            return "<", 1_000_000
-        case b"\xa1\xb2\xc3\xd4":
-            return ">", 1_000_000
-        case b"\x4d\x3c\xb2\xa1":
-            return "<", 1_000_000_000
-        case b"\xa1\xb2\x3c\x4d":
-            return ">", 1_000_000_000
-        case _:
-            raise ValueError("unsupported capture format; expected a classic pcap file, not pcapng")
+def packet_payload(packet: Packet, protocol: str | None) -> bytes:
+    """Return the raw application payload bytes from a pyshark packet."""
+    if protocol == "s7comm":
+        return b"".join(raw_layer_bytes(packet, layer_name) for layer_name in ("tpkt", "cotp", "s7comm"))
+    if protocol is not None:
+        return raw_layer_bytes(packet, protocol)
+    try:
+        return hex_bytes(field_value(packet.tcp.payload))
+    except AttributeError:
+        return b""
 
 
-def parse_ethernet_tcp_payload(frame: bytes, timestamp: float) -> TcpPayload | None:
-    """Parse an Ethernet frame into a TCP payload when possible."""
-    if len(frame) < MIN_ETHERNET_HEADER_LENGTH:
-        return None
-
-    offset = 12
-    ether_type = int.from_bytes(frame[offset : offset + 2], "big")
-    offset += 2
-
-    while ether_type in VLAN_ETHERTYPES:
-        if len(frame) < offset + 4:
-            return None
-        ether_type = int.from_bytes(frame[offset + 2 : offset + 4], "big")
-        offset += 4
-
-    payload = frame[offset:]
-    if ether_type == ETHERTYPE_IPV4:
-        return parse_ipv4_tcp_payload(payload, timestamp)
-    if ether_type == ETHERTYPE_IPV6:
-        return parse_ipv6_tcp_payload(payload, timestamp)
-    return None
+def raw_layer_bytes(packet: Packet, layer_name: str) -> bytes:
+    """Return one pyshark raw layer as bytes."""
+    try:
+        raw_layer = getattr(packet, f"{layer_name}_raw")
+    except AttributeError:
+        return b""
+    return hex_bytes(field_value(raw_layer.value))
 
 
-def parse_ipv4_tcp_payload(packet: bytes, timestamp: float) -> TcpPayload | None:
-    """Parse an IPv4 packet into a TCP payload when possible."""
-    if len(packet) < MIN_IPV4_HEADER_LENGTH:
-        return None
-
-    version = packet[0] >> 4
-    header_length = (packet[0] & 0x0F) * 4
-    if version != IPV4_VERSION or header_length < MIN_IPV4_HEADER_LENGTH or len(packet) < header_length:
-        return None
-
-    if packet[9] != TCP_PROTOCOL_NUMBER:
-        return None
-
-    fragment_field = int.from_bytes(packet[6:8], "big")
-    fragment_offset = fragment_field & 0x1FFF
-    if fragment_offset != 0:
-        return None
-
-    total_length = int.from_bytes(packet[2:4], "big")
-    if total_length < header_length:
-        return None
-
-    bounded_packet = packet[: min(total_length, len(packet))]
-    src_ip = str(ipaddress.IPv4Address(bounded_packet[12:16]))
-    dst_ip = str(ipaddress.IPv4Address(bounded_packet[16:20]))
-    return parse_tcp_segment(bounded_packet[header_length:], timestamp, src_ip, dst_ip)
+def tcp_payload(packet: Packet, payload: bytes) -> TcpPayload:
+    """Build a local TCP payload record from a pyshark packet."""
+    try:
+        ip_layer = packet.ip
+    except AttributeError:
+        ip_layer = packet.ipv6
+    return TcpPayload(
+        timestamp=sniff_timestamp(packet),
+        src_ip=str(ip_layer.src),
+        src_port=field_int(packet.tcp.srcport),
+        dst_ip=str(ip_layer.dst),
+        dst_port=field_int(packet.tcp.dstport),
+        seq=field_int(packet.tcp.seq_raw[-1]),
+        ack=field_int(packet.tcp.ack_raw[-1]),
+        payload=payload,
+    )
 
 
-def parse_ipv6_tcp_payload(packet: bytes, timestamp: float) -> TcpPayload | None:
-    """Parse a simple IPv6 packet into a TCP payload when possible."""
-    if len(packet) < MIN_IPV6_HEADER_LENGTH:
-        return None
+def sniff_timestamp(packet: Packet) -> float:
+    """Return a packet sniff timestamp as seconds since the epoch."""
+    sniff_timestamp_value = getattr(packet, "sniff_timestamp", None)
+    frame_info = getattr(packet, "frame_info", None)
+    time_epoch = getattr(frame_info, "time_epoch", None)
+    if sniff_timestamp_value is None:
+        if time_epoch is None:
+            raise ValueError("packet has no sniff timestamp")
+        return float(field_value(time_epoch))
 
-    version = packet[0] >> 4
-    next_header = packet[6]
-    if version != IPV6_VERSION or next_header != TCP_PROTOCOL_NUMBER:
-        return None
-
-    payload_length = int.from_bytes(packet[4:6], "big")
-    src_ip = str(ipaddress.IPv6Address(packet[8:24]))
-    dst_ip = str(ipaddress.IPv6Address(packet[24:40]))
-    payload_end = min(MIN_IPV6_HEADER_LENGTH + payload_length, len(packet))
-    return parse_tcp_segment(packet[MIN_IPV6_HEADER_LENGTH:payload_end], timestamp, src_ip, dst_ip)
+    try:
+        return float(sniff_timestamp_value)
+    except ValueError:
+        try:
+            return float(field_value(time_epoch))
+        except (AttributeError, ValueError):
+            return iso_timestamp(str(sniff_timestamp_value))
 
 
-def parse_tcp_segment(segment: bytes, timestamp: float, src_ip: str, dst_ip: str) -> TcpPayload | None:
-    """Parse a TCP segment and return it only when it has application payload."""
-    if len(segment) < MIN_TCP_HEADER_LENGTH:
-        return None
+def iso_timestamp(value: str) -> float:
+    """Return an ISO-8601 packet timestamp as seconds since the epoch."""
+    timestamp = value.removesuffix("Z") + ("+00:00" if value.endswith("Z") else "")
+    if "." in timestamp:
+        date_part, rest = timestamp.split(".", maxsplit=1)
+        timezone_index = min((index for index in (rest.find("+"), rest.find("-")) if index != -1), default=len(rest))
+        timestamp = f"{date_part}.{rest[:timezone_index][:6]}{rest[timezone_index:]}"
+    return datetime.fromisoformat(timestamp).timestamp()
 
-    src_port, dst_port = struct.unpack("!HH", segment[:4])
-    seq, ack = struct.unpack("!II", segment[4:12])
-    header_length = (segment[12] >> 4) * 4
-    if header_length < MIN_TCP_HEADER_LENGTH or len(segment) < header_length:
-        return None
 
-    payload = segment[header_length:]
+def field_value(value: object) -> str:
+    """Return a pyshark field's display value."""
+    raw_value = getattr(value, "value", None)
+    if raw_value is not None:
+        return str(raw_value)
+    return str(value)
 
-    return TcpPayload(timestamp=timestamp, src_ip=src_ip, src_port=src_port, dst_ip=dst_ip, dst_port=dst_port, seq=seq, ack=ack, payload=payload)
+
+def field_int(value: object) -> int:
+    """Return a pyshark field as an integer."""
+    return int(field_value(value))
+
+
+def hex_bytes(value: str) -> bytes:
+    """Convert a tshark hex string into bytes."""
+    hex_text = value.replace(":", "").replace(" ", "")
+    return bytes.fromhex(hex_text)
 
 
 def write_dataset(pairs: Iterable[RequestResponsePair], output_path: Path, output_format: OutputFormat) -> int:

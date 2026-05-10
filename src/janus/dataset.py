@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
     from speculum.models.validation_mode import ValidationMode
 
-    from janus.model import RequestResponsePair
+    from janus.model.request_response_pair import RequestResponsePair
 
 
 def iter_speculum_records_from_pairs(pairs: Iterable[RequestResponsePair], *, request_type: str, seed: int, validation_mode: ValidationMode) -> Iterator[ResultRecord]:
@@ -38,8 +38,11 @@ def iter_speculum_records_from_pairs(pairs: Iterable[RequestResponsePair], *, re
 
 def load_speculum_result_record(line: str, input_path: Path, line_number: int) -> ResultRecord:
     """Load one Speculum ``ResultRecord`` from a JSONL row."""
-    raw_record = json.loads(line)
-    return ResultRecord.from_json_dict(raw_record)
+    try:
+        raw_record = json.loads(line)
+        return ResultRecord.from_json_dict(raw_record)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid Speculum result record at {input_path}:{line_number}") from exc
 
 
 def write_speculum_result_datasets(records: Iterable[ResultRecord], output_base_path: Path, output_formats: Iterable[OutputFormat]) -> dict[Path, int]:
